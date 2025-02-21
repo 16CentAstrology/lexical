@@ -6,6 +6,8 @@
  *
  */
 
+import type {JSX} from 'react';
+
 import {
   DecoratorNode,
   DOMConversionMap,
@@ -17,7 +19,6 @@ import {
   Spread,
 } from 'lexical';
 import * as React from 'react';
-import {Suspense} from 'react';
 
 export type Options = ReadonlyArray<Option>;
 
@@ -27,16 +28,13 @@ export type Option = Readonly<{
   votes: Array<number>;
 }>;
 
-const PollComponent = React.lazy(
-  // @ts-ignore
-  () => import('./PollComponent'),
-);
+const PollComponent = React.lazy(() => import('./PollComponent'));
 
 function createUID(): string {
   return Math.random()
     .toString(36)
     .replace(/[^a-z]+/g, '')
-    .substr(0, 5);
+    .substring(0, 5);
 }
 
 export function createPollOption(text = ''): Option {
@@ -63,16 +61,15 @@ export type SerializedPollNode = Spread<
   {
     question: string;
     options: Options;
-    type: 'poll';
-    version: 1;
   },
   SerializedLexicalNode
 >;
 
-function convertPollElement(domNode: HTMLElement): DOMConversionOutput | null {
+function $convertPollElement(domNode: HTMLElement): DOMConversionOutput | null {
   const question = domNode.getAttribute('data-lexical-poll-question');
-  if (question !== null) {
-    const node = $createPollNode(question);
+  const options = domNode.getAttribute('data-lexical-poll-options');
+  if (question !== null && options !== null) {
+    const node = $createPollNode(question, JSON.parse(options));
     return {node};
   }
   return null;
@@ -91,23 +88,23 @@ export class PollNode extends DecoratorNode<JSX.Element> {
   }
 
   static importJSON(serializedNode: SerializedPollNode): PollNode {
-    const node = $createPollNode(serializedNode.question);
-    serializedNode.options.forEach(node.addOption);
-    return node;
+    return $createPollNode(
+      serializedNode.question,
+      serializedNode.options,
+    ).updateFromJSON(serializedNode);
   }
 
-  constructor(question: string, options?: Options, key?: NodeKey) {
+  constructor(question: string, options: Options, key?: NodeKey) {
     super(key);
     this.__question = question;
-    this.__options = options || [createPollOption(), createPollOption()];
+    this.__options = options;
   }
 
   exportJSON(): SerializedPollNode {
     return {
+      ...super.exportJSON(),
       options: this.__options,
       question: this.__question,
-      type: 'poll',
-      version: 1,
     };
   }
 
@@ -159,7 +156,7 @@ export class PollNode extends DecoratorNode<JSX.Element> {
           return null;
         }
         return {
-          conversion: convertPollElement,
+          conversion: $convertPollElement,
           priority: 2,
         };
       },
@@ -169,6 +166,10 @@ export class PollNode extends DecoratorNode<JSX.Element> {
   exportDOM(): DOMExportOutput {
     const element = document.createElement('span');
     element.setAttribute('data-lexical-poll-question', this.__question);
+    element.setAttribute(
+      'data-lexical-poll-options',
+      JSON.stringify(this.__options),
+    );
     return {element};
   }
 
@@ -184,19 +185,17 @@ export class PollNode extends DecoratorNode<JSX.Element> {
 
   decorate(): JSX.Element {
     return (
-      <Suspense fallback={null}>
-        <PollComponent
-          question={this.__question}
-          options={this.__options}
-          nodeKey={this.__key}
-        />
-      </Suspense>
+      <PollComponent
+        question={this.__question}
+        options={this.__options}
+        nodeKey={this.__key}
+      />
     );
   }
 }
 
-export function $createPollNode(question: string): PollNode {
-  return new PollNode(question);
+export function $createPollNode(question: string, options: Options): PollNode {
+  return new PollNode(question, options);
 }
 
 export function $isPollNode(

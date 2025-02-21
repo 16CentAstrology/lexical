@@ -7,8 +7,8 @@
  */
 
 import type {
+  BaseSelection,
   ElementNode,
-  GridSelection,
   LexicalNode,
   NodeKey,
   Point,
@@ -16,10 +16,12 @@ import type {
   TextNode,
 } from 'lexical';
 
+import {TableSelection} from '@lexical/table';
 import {
+  $createRangeSelection,
   $getAdjacentNode,
   $getPreviousSelection,
-  $getRoot,
+  $getSelection,
   $hasAncestor,
   $isDecoratorNode,
   $isElementNode,
@@ -29,51 +31,83 @@ import {
   $isRootOrShadowRoot,
   $isTextNode,
   $setSelection,
+  INTERNAL_$isBlock,
 } from 'lexical';
+import invariant from 'shared/invariant';
 
 import {getStyleObjectFromCSS} from './utils';
 
-/**
- * Converts all nodes in the selection that are of one block type to another specified by parameter
- *
- * @param selection
- * @param createElement
- * @returns
- */
-export function $setBlocksType_experimental(
-  selection: RangeSelection | GridSelection,
-
-  createElement: () => ElementNode,
+export function $copyBlockFormatIndent(
+  srcNode: ElementNode,
+  destNode: ElementNode,
 ): void {
-  if (selection.anchor.key === 'root') {
-    const element = createElement();
-    const root = $getRoot();
-    const firstChild = root.getFirstChild();
-    if (firstChild) firstChild.replace(element, true);
-    else root.append(element);
-    return;
+  const format = srcNode.getFormatType();
+  const indent = srcNode.getIndent();
+  if (format !== destNode.getFormatType()) {
+    destNode.setFormat(format);
   }
-
-  const nodes = selection.getNodes();
-  if (selection.anchor.type === 'text') {
-    let firstBlock = selection.anchor.getNode().getParent() as LexicalNode;
-    firstBlock = (
-      firstBlock.isInline() ? firstBlock.getParent() : firstBlock
-    ) as LexicalNode;
-    if (nodes.indexOf(firstBlock) === -1) nodes.push(firstBlock);
-  }
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    if (!isBlock(node)) continue;
-    const targetElement = createElement();
-    targetElement.setFormat(node.getFormatType());
-    targetElement.setIndent(node.getIndent());
-    node.replace(targetElement, true);
+  if (indent !== destNode.getIndent()) {
+    destNode.setIndent(indent);
   }
 }
 
-function isBlock(node: LexicalNode) {
-  return $isElementNode(node) && !$isRootOrShadowRoot(node) && !node.isInline();
+/**
+ * Converts all nodes in the selection that are of one block type to another.
+ * @param selection - The selected blocks to be converted.
+ * @param $createElement - The function that creates the node. eg. $createParagraphNode.
+ * @param $afterCreateElement - The function that updates the new node based on the previous one ($copyBlockFormatIndent by default)
+ */
+export function $setBlocksType<T extends ElementNode>(
+  selection: BaseSelection | null,
+  $createElement: () => T,
+  $afterCreateElement: (
+    prevNodeSrc: ElementNode,
+    newNodeDest: T,
+  ) => void = $copyBlockFormatIndent,
+): void {
+  if (selection === null) {
+    return;
+  }
+  // Selections tend to not include their containing blocks so we effectively
+  // expand it here
+  const anchorAndFocus = selection.getStartEndPoints();
+  const blockMap = new Map<NodeKey, ElementNode>();
+  let newSelection: RangeSelection | null = null;
+  if (anchorAndFocus) {
+    const [anchor, focus] = anchorAndFocus;
+    newSelection = $createRangeSelection();
+    newSelection.anchor.set(anchor.key, anchor.offset, anchor.type);
+    newSelection.focus.set(focus.key, focus.offset, focus.type);
+    const anchorBlock = $getAncestor(anchor.getNode(), INTERNAL_$isBlock);
+    const focusBlock = $getAncestor(focus.getNode(), INTERNAL_$isBlock);
+    if ($isElementNode(anchorBlock)) {
+      blockMap.set(anchorBlock.getKey(), anchorBlock);
+    }
+    if ($isElementNode(focusBlock)) {
+      blockMap.set(focusBlock.getKey(), focusBlock);
+    }
+  }
+  for (const node of selection.getNodes()) {
+    if ($isElementNode(node) && INTERNAL_$isBlock(node)) {
+      blockMap.set(node.getKey(), node);
+    }
+  }
+  for (const [key, prevNode] of blockMap) {
+    const element = $createElement();
+    $afterCreateElement(prevNode, element);
+    prevNode.replace(element, true);
+    if (newSelection) {
+      if (key === newSelection.anchor.key) {
+        newSelection.anchor.key = element.getKey();
+      }
+      if (key === newSelection.focus.key) {
+        newSelection.focus.key = element.getKey();
+      }
+    }
+  }
+  if (newSelection && selection.is($getSelection())) {
+    $setSelection(newSelection);
+  }
 }
 
 function isPointAttached(point: Point): boolean {
@@ -95,20 +129,29 @@ function $removeParentEmptyElements(startingNode: ElementNode): void {
   }
 }
 
+/**
+ * @deprecated
+ * Wraps all nodes in the selection into another node of the type returned by createElement.
+ * @param selection - The selection of nodes to be wrapped.
+ * @param createElement - A function that creates the wrapping ElementNode. eg. $createParagraphNode.
+ * @param wrappingElement - An element to append the wrapped selection and its children to.
+ */
 export function $wrapNodes(
-  selection: RangeSelection | GridSelection,
+  selection: BaseSelection,
   createElement: () => ElementNode,
   wrappingElement: null | ElementNode = null,
 ): void {
+  const anchorAndFocus = selection.getStartEndPoints();
+  const anchor = anchorAndFocus ? anchorAndFocus[0] : null;
   const nodes = selection.getNodes();
   const nodesLength = nodes.length;
-  const anchor = selection.anchor;
 
   if (
-    nodesLength === 0 ||
-    (nodesLength === 1 &&
-      anchor.type === 'element' &&
-      anchor.getNode().getChildrenSize() === 0)
+    anchor !== null &&
+    (nodesLength === 0 ||
+      (nodesLength === 1 &&
+        anchor.type === 'element' &&
+        anchor.getNode().getChildrenSize() === 0))
   ) {
     const target =
       anchor.type === 'text'
@@ -172,8 +215,17 @@ export function $wrapNodes(
   );
 }
 
+/**
+ * Wraps each node into a new ElementNode.
+ * @param selection - The selection of nodes to wrap.
+ * @param nodes - An array of nodes, generally the descendants of the selection.
+ * @param nodesLength - The length of nodes.
+ * @param createElement - A function that creates the wrapping ElementNode. eg. $createParagraphNode.
+ * @param wrappingElement - An element to wrap all the nodes into.
+ * @returns
+ */
 export function $wrapNodesImpl(
-  selection: RangeSelection | GridSelection,
+  selection: BaseSelection,
   nodes: LexicalNode[],
   nodesLength: number,
   createElement: () => ElementNode,
@@ -265,6 +317,10 @@ export function $wrapNodesImpl(
         $removeParentEmptyElements(parent);
       }
     } else if (emptyElements.has(node.getKey())) {
+      invariant(
+        $isElementNode(node),
+        'Expected node in emptyElements to be an ElementNode',
+      );
       const targetElement = createElement();
       targetElement.setFormat(node.getFormatType());
       targetElement.setIndent(node.getIndent());
@@ -349,6 +405,12 @@ export function $wrapNodesImpl(
   }
 }
 
+/**
+ * Determines if the default character selection should be overridden. Used with DecoratorNodes
+ * @param selection - The selection whose default character selection may need to be overridden.
+ * @param isBackward - Is the selection backwards (the focus comes before the anchor)?
+ * @returns true if it should be overridden, false if not.
+ */
 export function $shouldOverrideDefaultCharacterSelection(
   selection: RangeSelection,
   isBackward: boolean,
@@ -363,6 +425,13 @@ export function $shouldOverrideDefaultCharacterSelection(
   );
 }
 
+/**
+ * Moves the selection according to the arguments.
+ * @param selection - The selected text or nodes.
+ * @param isHoldingShift - Is the shift key being held down during the operation.
+ * @param isBackward - Is the selection selected backwards (the focus comes before the anchor)?
+ * @param granularity - The distance to adjust the current selection.
+ */
 export function $moveCaretSelection(
   selection: RangeSelection,
   isHoldingShift: boolean,
@@ -372,6 +441,11 @@ export function $moveCaretSelection(
   selection.modify(isHoldingShift ? 'extend' : 'move', isBackward, granularity);
 }
 
+/**
+ * Tests a parent element for right to left direction.
+ * @param selection - The selection whose parent is to be tested.
+ * @returns true if the selections' parent element has a direction of 'rtl' (right to left), false otherwise.
+ */
 export function $isParentElementRTL(selection: RangeSelection): boolean {
   const anchorNode = selection.anchor.getNode();
   const parent = $isRootNode(anchorNode)
@@ -381,6 +455,12 @@ export function $isParentElementRTL(selection: RangeSelection): boolean {
   return parent.getDirection() === 'rtl';
 }
 
+/**
+ * Moves selection by character according to arguments.
+ * @param selection - The selection of the characters to move.
+ * @param isHoldingShift - Is the shift key being held down during the operation.
+ * @param isBackward - Is the selection backward (the focus comes before the anchor)?
+ */
 export function $moveCharacter(
   selection: RangeSelection,
   isHoldingShift: boolean,
@@ -395,37 +475,13 @@ export function $moveCharacter(
   );
 }
 
-export function $selectAll(selection: RangeSelection): void {
-  const anchor = selection.anchor;
-  const focus = selection.focus;
-  const anchorNode = anchor.getNode();
-  const topParent = anchorNode.getTopLevelElementOrThrow();
-  const root = topParent.getParentOrThrow();
-  let firstNode = root.getFirstDescendant();
-  let lastNode = root.getLastDescendant();
-  let firstType: 'element' | 'text' = 'element';
-  let lastType: 'element' | 'text' = 'element';
-  let lastOffset = 0;
-
-  if ($isTextNode(firstNode)) {
-    firstType = 'text';
-  } else if (!$isElementNode(firstNode) && firstNode !== null) {
-    firstNode = firstNode.getParentOrThrow();
-  }
-
-  if ($isTextNode(lastNode)) {
-    lastType = 'text';
-    lastOffset = lastNode.getTextContentSize();
-  } else if (!$isElementNode(lastNode) && lastNode !== null) {
-    lastNode = lastNode.getParentOrThrow();
-  }
-
-  if (firstNode && lastNode) {
-    anchor.set(firstNode.getKey(), 0, firstType);
-    focus.set(lastNode.getKey(), lastOffset, lastType);
-  }
-}
-
+/**
+ * Returns the current value of a CSS property for Nodes, if set. If not set, it returns the defaultValue.
+ * @param node - The node whose style value to get.
+ * @param styleProperty - The CSS style property.
+ * @param defaultValue - The default value for the property.
+ * @returns The value of the property for node.
+ */
 function $getNodeStyleValueForProperty(
   node: TextNode,
   styleProperty: string,
@@ -441,18 +497,39 @@ function $getNodeStyleValueForProperty(
   return defaultValue;
 }
 
+/**
+ * Returns the current value of a CSS property for TextNodes in the Selection, if set. If not set, it returns the defaultValue.
+ * If all TextNodes do not have the same value, it returns an empty string.
+ * @param selection - The selection of TextNodes whose value to find.
+ * @param styleProperty - The CSS style property.
+ * @param defaultValue - The default value for the property, defaults to an empty string.
+ * @returns The value of the property for the selected TextNodes.
+ */
 export function $getSelectionStyleValueForProperty(
-  selection: RangeSelection,
+  selection: RangeSelection | TableSelection,
   styleProperty: string,
   defaultValue = '',
 ): string {
-  let styleValue = null;
+  let styleValue: string | null = null;
   const nodes = selection.getNodes();
   const anchor = selection.anchor;
   const focus = selection.focus;
   const isBackward = selection.isBackward();
   const endOffset = isBackward ? focus.offset : anchor.offset;
   const endNode = isBackward ? focus.getNode() : anchor.getNode();
+
+  if (
+    $isRangeSelection(selection) &&
+    selection.isCollapsed() &&
+    selection.style !== ''
+  ) {
+    const css = selection.style;
+    const styleObject = getStyleObjectFromCSS(css);
+
+    if (styleObject !== null && styleProperty in styleObject) {
+      return styleObject[styleProperty];
+    }
+  }
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
@@ -475,7 +552,7 @@ export function $getSelectionStyleValueForProperty(
         styleValue = nodeStyleValue;
       } else if (styleValue !== nodeStyleValue) {
         // multiple text nodes are in the selection and they don't all
-        // have the same font size.
+        // have the same style.
         styleValue = '';
         break;
       }
@@ -483,4 +560,15 @@ export function $getSelectionStyleValueForProperty(
   }
 
   return styleValue === null ? defaultValue : styleValue;
+}
+
+export function $getAncestor<NodeType extends LexicalNode = LexicalNode>(
+  node: LexicalNode,
+  predicate: (ancestor: LexicalNode) => ancestor is NodeType,
+) {
+  let parent = node;
+  while (parent !== null && parent.getParent() !== null && !predicate(parent)) {
+    parent = parent.getParentOrThrow();
+  }
+  return predicate(parent) ? parent : null;
 }
