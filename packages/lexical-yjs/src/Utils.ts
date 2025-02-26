@@ -9,18 +9,20 @@
 import type {Binding, YjsNode} from '.';
 import type {
   DecoratorNode,
+  EditorState,
   ElementNode,
   LexicalNode,
-  NodeMap,
   RangeSelection,
   TextNode,
 } from 'lexical';
 
 import {
   $getNodeByKey,
+  $getRoot,
   $isDecoratorNode,
   $isElementNode,
   $isLineBreakNode,
+  $isRootNode,
   $isTextNode,
   createEditor,
   NodeKey,
@@ -39,17 +41,46 @@ import {
 } from './CollabLineBreakNode';
 import {$createCollabTextNode, CollabTextNode} from './CollabTextNode';
 
-const excludedProperties: Set<string> = new Set([
+const baseExcludedProperties = new Set<string>([
   '__key',
   '__parent',
-  '__cachedText',
-  '__text',
-  '__size',
   '__next',
   '__prev',
+]);
+const elementExcludedProperties = new Set<string>([
   '__first',
   '__last',
+  '__size',
 ]);
+const rootExcludedProperties = new Set<string>(['__cachedText']);
+const textExcludedProperties = new Set<string>(['__text']);
+
+function isExcludedProperty(
+  name: string,
+  node: LexicalNode,
+  binding: Binding,
+): boolean {
+  if (baseExcludedProperties.has(name)) {
+    return true;
+  }
+
+  if ($isTextNode(node)) {
+    if (textExcludedProperties.has(name)) {
+      return true;
+    }
+  } else if ($isElementNode(node)) {
+    if (
+      elementExcludedProperties.has(name) ||
+      ($isRootNode(node) && rootExcludedProperties.has(name))
+    ) {
+      return true;
+    }
+  }
+
+  const nodeKlass = node.constructor;
+  const excludedProperties = binding.excludedProperties.get(nodeKlass);
+  return excludedProperties != null && excludedProperties.has(name);
+}
 
 export function getIndexOfYjsNode(
   yjsParentNode: YjsNode,
@@ -140,7 +171,7 @@ function getNodeTypeFromSharedType(
   return type;
 }
 
-export function getOrInitCollabNodeFromSharedType(
+export function $getOrInitCollabNodeFromSharedType(
   binding: Binding,
   sharedType: XmlText | YMap<unknown> | XmlElement,
   parent?: CollabElementNode,
@@ -149,7 +180,6 @@ export function getOrInitCollabNodeFromSharedType(
   | CollabTextNode
   | CollabLineBreakNode
   | CollabDecoratorNode {
-  // @ts-expect-error: internal field
   const collabNode = sharedType._collabNode;
 
   if (collabNode === undefined) {
@@ -161,7 +191,7 @@ export function getOrInitCollabNodeFromSharedType(
     const sharedParent = sharedType.parent;
     const targetParent =
       parent === undefined && sharedParent !== null
-        ? getOrInitCollabNodeFromSharedType(
+        ? $getOrInitCollabNodeFromSharedType(
             binding,
             sharedParent as XmlText | YMap<unknown> | XmlElement,
           )
@@ -239,12 +269,11 @@ export function syncPropertiesFromYjs(
 
   for (let i = 0; i < properties.length; i++) {
     const property = properties[i];
-
-    if (excludedProperties.has(property)) {
+    if (isExcludedProperty(property, lexicalNode, binding)) {
       continue;
     }
-
-    const prevValue = lexicalNode[property];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevValue = (lexicalNode as any)[property];
     let nextValue =
       sharedType instanceof YMap
         ? sharedType.get(property)
@@ -270,7 +299,7 @@ export function syncPropertiesFromYjs(
         writableNode = lexicalNode.getWritable();
       }
 
-      writableNode[property] = nextValue;
+      writableNode[property as keyof typeof writableNode] = nextValue;
     }
   }
 }
@@ -284,10 +313,9 @@ export function syncPropertiesFromLexical(
   const type = nextLexicalNode.__type;
   const nodeProperties = binding.nodeProperties;
   let properties = nodeProperties.get(type);
-
   if (properties === undefined) {
     properties = Object.keys(nextLexicalNode).filter((property) => {
-      return !excludedProperties.has(property);
+      return !isExcludedProperty(property, nextLexicalNode, binding);
     });
     nodeProperties.set(type, properties);
   }
@@ -297,8 +325,10 @@ export function syncPropertiesFromLexical(
   for (let i = 0; i < properties.length; i++) {
     const property = properties[i];
     const prevValue =
-      prevLexicalNode === null ? undefined : prevLexicalNode[property];
-    let nextValue = nextLexicalNode[property];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      prevLexicalNode === null ? undefined : (prevLexicalNode as any)[property];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let nextValue = (nextLexicalNode as any)[property];
 
     if (prevValue !== nextValue) {
       if (nextValue instanceof EditorClass) {
@@ -306,7 +336,6 @@ export function syncPropertiesFromLexical(
         let prevDoc;
 
         if (prevValue instanceof EditorClass) {
-          // @ts-expect-error Lexical node
           const prevKey = prevValue._key;
           prevDoc = yjsDocMap.get(prevKey);
           yjsDocMap.delete(prevKey);
@@ -315,7 +344,6 @@ export function syncPropertiesFromLexical(
         // If we already have a document, use it.
         const doc = prevDoc || new Doc();
         const key = doc.guid;
-        // @ts-expect-error Lexical node
         nextValue._key = key;
         yjsDocMap.set(key, doc);
         nextValue = doc;
@@ -446,24 +474,6 @@ export function syncWithTransaction(binding: Binding, fn: () => void): void {
   binding.doc.transact(fn, binding);
 }
 
-export function createChildrenArray(
-  element: ElementNode,
-  nodeMap: null | NodeMap,
-): Array<NodeKey> {
-  const children = [];
-  let nodeKey = element.__first;
-  while (nodeKey !== null) {
-    const node =
-      nodeMap === null ? $getNodeByKey(nodeKey) : nodeMap.get(nodeKey);
-    if (node === null || node === undefined) {
-      invariant(false, 'createChildrenArray: node does not exist in nodeMap');
-    }
-    children.push(nodeKey);
-    nodeKey = node.__next;
-  }
-  return children;
-}
-
 export function removeFromParent(node: LexicalNode): void {
   const oldParent = node.getParent();
   if (oldParent !== null) {
@@ -512,5 +522,39 @@ export function removeFromParent(node: LexicalNode): void {
     }
     writableParent.__size--;
     writableNode.__parent = null;
+  }
+}
+
+export function $moveSelectionToPreviousNode(
+  anchorNodeKey: string,
+  currentEditorState: EditorState,
+) {
+  const anchorNode = currentEditorState._nodeMap.get(anchorNodeKey);
+  if (!anchorNode) {
+    $getRoot().selectStart();
+    return;
+  }
+  // Get previous node
+  const prevNodeKey = anchorNode.__prev;
+  let prevNode: ElementNode | null = null;
+  if (prevNodeKey) {
+    prevNode = $getNodeByKey(prevNodeKey);
+  }
+
+  // If previous node not found, get parent node
+  if (prevNode === null && anchorNode.__parent !== null) {
+    prevNode = $getNodeByKey(anchorNode.__parent);
+  }
+  if (prevNode === null) {
+    $getRoot().selectStart();
+    return;
+  }
+
+  if (prevNode !== null && prevNode.isAttached()) {
+    prevNode.selectEnd();
+    return;
+  } else {
+    // If the found node is also deleted, select the next one
+    $moveSelectionToPreviousNode(prevNode.__key, currentEditorState);
   }
 }
