@@ -7,4 +7,15 @@
  * @flow strict
  */
 
-declare export function TabIndentationPlugin(): null;
+import type {LexicalEditor} from 'lexical';
+
+declare export function registerTabIndentation(
+  editor: LexicalEditor,
+  maxIndent?: number,
+): () => void;
+
+type Props = $ReadOnly<{
+  maxIndent?: number,
+}>;
+
+declare export function TabIndentationPlugin(props: Props): null;

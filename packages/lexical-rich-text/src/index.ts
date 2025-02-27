@@ -1,4 +1,3 @@
-/** @module @lexical/rich-text */
 /**
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
@@ -11,11 +10,13 @@ import type {
   CommandPayloadType,
   DOMConversionMap,
   DOMConversionOutput,
+  DOMExportOutput,
   EditorConfig,
   ElementFormatType,
   LexicalCommand,
   LexicalEditor,
   LexicalNode,
+  LexicalUpdateJSON,
   NodeKey,
   ParagraphNode,
   PasteCommandType,
@@ -27,25 +28,30 @@ import type {
 
 import {
   $insertDataTransferForRichText,
-  copyToClipboard__EXPERIMENTAL,
+  copyToClipboard,
 } from '@lexical/clipboard';
 import {
   $moveCharacter,
   $shouldOverrideDefaultCharacterSelection,
 } from '@lexical/selection';
 import {
+  $findMatchingParent,
   $getNearestBlockElementAncestorOrThrow,
   addClassNamesToElement,
+  isHTMLElement,
   mergeRegister,
+  objectKlassEquals,
 } from '@lexical/utils';
 import {
   $applyNodeReplacement,
   $createParagraphNode,
   $createRangeSelection,
+  $createTabNode,
   $getAdjacentNode,
   $getNearestNodeFromDOMNode,
   $getRoot,
   $getSelection,
+  $insertNodes,
   $isDecoratorNode,
   $isElementNode,
   $isNodeSelection,
@@ -53,6 +59,7 @@ import {
   $isRootNode,
   $isTextNode,
   $normalizeSelection__EXPERIMENTAL,
+  $selectAll,
   $setSelection,
   CLICK_COMMAND,
   COMMAND_PRIORITY_EDITOR,
@@ -63,7 +70,6 @@ import {
   DELETE_CHARACTER_COMMAND,
   DELETE_LINE_COMMAND,
   DELETE_WORD_COMMAND,
-  DEPRECATED_$isGridSelection,
   DRAGOVER_COMMAND,
   DRAGSTART_COMMAND,
   DROP_COMMAND,
@@ -73,6 +79,9 @@ import {
   INDENT_CONTENT_COMMAND,
   INSERT_LINE_BREAK_COMMAND,
   INSERT_PARAGRAPH_COMMAND,
+  INSERT_TAB_COMMAND,
+  isDOMNode,
+  isSelectionCapturedInDecoratorInput,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_LEFT_COMMAND,
   KEY_ARROW_RIGHT_COMMAND,
@@ -81,18 +90,25 @@ import {
   KEY_DELETE_COMMAND,
   KEY_ENTER_COMMAND,
   KEY_ESCAPE_COMMAND,
+  KEY_SPACE_COMMAND,
+  KEY_TAB_COMMAND,
   OUTDENT_CONTENT_COMMAND,
   PASTE_COMMAND,
   REMOVE_TEXT_COMMAND,
+  SELECT_ALL_COMMAND,
+  setNodeIndentFromDOM,
 } from 'lexical';
 import caretFromPoint from 'shared/caretFromPoint';
-import {CAN_USE_BEFORE_INPUT, IS_IOS, IS_SAFARI} from 'shared/environment';
+import {
+  CAN_USE_BEFORE_INPUT,
+  IS_APPLE_WEBKIT,
+  IS_IOS,
+  IS_SAFARI,
+} from 'shared/environment';
 
 export type SerializedHeadingNode = Spread<
   {
     tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
-    type: 'heading';
-    version: 1;
   },
   SerializedElementNode
 >;
@@ -101,13 +117,7 @@ export const DRAG_DROP_PASTE: LexicalCommand<Array<File>> = createCommand(
   'DRAG_DROP_PASTE_FILE',
 );
 
-export type SerializedQuoteNode = Spread<
-  {
-    type: 'quote';
-    version: 1;
-  },
-  SerializedElementNode
->;
+export type SerializedQuoteNode = SerializedElementNode;
 
 /** @noInheritDoc */
 export class QuoteNode extends ElementNode {
@@ -119,10 +129,6 @@ export class QuoteNode extends ElementNode {
     return new QuoteNode(node.__key);
   }
 
-  constructor(key?: NodeKey) {
-    super(key);
-  }
-
   // View
 
   createDOM(config: EditorConfig): HTMLElement {
@@ -130,32 +136,43 @@ export class QuoteNode extends ElementNode {
     addClassNamesToElement(element, config.theme.quote);
     return element;
   }
-  updateDOM(prevNode: QuoteNode, dom: HTMLElement): boolean {
+  updateDOM(prevNode: this, dom: HTMLElement): boolean {
     return false;
   }
 
   static importDOM(): DOMConversionMap | null {
     return {
       blockquote: (node: Node) => ({
-        conversion: convertBlockquoteElement,
+        conversion: $convertBlockquoteElement,
         priority: 0,
       }),
     };
   }
 
-  static importJSON(serializedNode: SerializedQuoteNode): QuoteNode {
-    const node = $createQuoteNode();
-    node.setFormat(serializedNode.format);
-    node.setIndent(serializedNode.indent);
-    node.setDirection(serializedNode.direction);
-    return node;
+  exportDOM(editor: LexicalEditor): DOMExportOutput {
+    const {element} = super.exportDOM(editor);
+
+    if (isHTMLElement(element)) {
+      if (this.isEmpty()) {
+        element.append(document.createElement('br'));
+      }
+
+      const formatType = this.getFormatType();
+      element.style.textAlign = formatType;
+
+      const direction = this.getDirection();
+      if (direction) {
+        element.dir = direction;
+      }
+    }
+
+    return {
+      element,
+    };
   }
 
-  exportJSON(): SerializedElementNode {
-    return {
-      ...super.exportJSON(),
-      type: 'quote',
-    };
+  static importJSON(serializedNode: SerializedQuoteNode): QuoteNode {
+    return $createQuoteNode().updateFromJSON(serializedNode);
   }
 
   // Mutation
@@ -173,6 +190,10 @@ export class QuoteNode extends ElementNode {
     const children = this.getChildren();
     children.forEach((child) => paragraph.append(child));
     this.replace(paragraph);
+    return true;
+  }
+
+  canMergeWhenEmpty(): true {
     return true;
   }
 }
@@ -211,6 +232,12 @@ export class HeadingNode extends ElementNode {
     return this.__tag;
   }
 
+  setTag(tag: HeadingTagType): this {
+    const self = this.getWritable();
+    this.__tag = tag;
+    return self;
+  }
+
   // View
 
   createDOM(config: EditorConfig): HTMLElement {
@@ -225,34 +252,34 @@ export class HeadingNode extends ElementNode {
     return element;
   }
 
-  updateDOM(prevNode: HeadingNode, dom: HTMLElement): boolean {
-    return false;
+  updateDOM(prevNode: this, dom: HTMLElement, config: EditorConfig): boolean {
+    return prevNode.__tag !== this.__tag;
   }
 
   static importDOM(): DOMConversionMap | null {
     return {
       h1: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       h2: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       h3: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       h4: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       h5: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       h6: (node: Node) => ({
-        conversion: convertHeadingElement,
+        conversion: $convertHeadingElement,
         priority: 0,
       }),
       p: (node: Node) => {
@@ -282,20 +309,45 @@ export class HeadingNode extends ElementNode {
       },
     };
   }
+
+  exportDOM(editor: LexicalEditor): DOMExportOutput {
+    const {element} = super.exportDOM(editor);
+
+    if (isHTMLElement(element)) {
+      if (this.isEmpty()) {
+        element.append(document.createElement('br'));
+      }
+
+      const formatType = this.getFormatType();
+      element.style.textAlign = formatType;
+
+      const direction = this.getDirection();
+      if (direction) {
+        element.dir = direction;
+      }
+    }
+
+    return {
+      element,
+    };
+  }
+
   static importJSON(serializedNode: SerializedHeadingNode): HeadingNode {
-    const node = $createHeadingNode(serializedNode.tag);
-    node.setFormat(serializedNode.format);
-    node.setIndent(serializedNode.indent);
-    node.setDirection(serializedNode.direction);
-    return node;
+    return $createHeadingNode(serializedNode.tag).updateFromJSON(
+      serializedNode,
+    );
+  }
+
+  updateFromJSON(
+    serializedNode: LexicalUpdateJSON<SerializedHeadingNode>,
+  ): this {
+    return super.updateFromJSON(serializedNode).setTag(serializedNode.tag);
   }
 
   exportJSON(): SerializedHeadingNode {
     return {
       ...super.exportJSON(),
       tag: this.getTag(),
-      type: 'heading',
-      version: 1,
     };
   }
 
@@ -305,13 +357,24 @@ export class HeadingNode extends ElementNode {
     restoreSelection = true,
   ): ParagraphNode | HeadingNode {
     const anchorOffet = selection ? selection.anchor.offset : 0;
+    const lastDesc = this.getLastDescendant();
+    const isAtEnd =
+      !lastDesc ||
+      (selection &&
+        selection.anchor.key === lastDesc.getKey() &&
+        anchorOffet === lastDesc.getTextContentSize());
     const newElement =
-      anchorOffet > 0 && anchorOffet < this.getTextContentSize()
-        ? $createHeadingNode(this.getTag())
-        : $createParagraphNode();
+      isAtEnd || !selection
+        ? $createParagraphNode()
+        : $createHeadingNode(this.getTag());
     const direction = this.getDirection();
     newElement.setDirection(direction);
     this.insertAfter(newElement, restoreSelection);
+    if (anchorOffet === 0 && !this.isEmpty() && selection) {
+      const paragraph = $createParagraphNode();
+      paragraph.select();
+      this.replace(paragraph, true);
+    }
     return newElement;
   }
 
@@ -337,8 +400,8 @@ function isGoogleDocsTitle(domNode: Node): boolean {
   return false;
 }
 
-function convertHeadingElement(domNode: Node): DOMConversionOutput {
-  const nodeName = domNode.nodeName.toLowerCase();
+function $convertHeadingElement(element: HTMLElement): DOMConversionOutput {
+  const nodeName = element.nodeName.toLowerCase();
   let node = null;
   if (
     nodeName === 'h1' ||
@@ -349,16 +412,26 @@ function convertHeadingElement(domNode: Node): DOMConversionOutput {
     nodeName === 'h6'
   ) {
     node = $createHeadingNode(nodeName);
+    if (element.style !== null) {
+      setNodeIndentFromDOM(element, node);
+      node.setFormat(element.style.textAlign as ElementFormatType);
+    }
   }
   return {node};
 }
 
-function convertBlockquoteElement(): DOMConversionOutput {
+function $convertBlockquoteElement(element: HTMLElement): DOMConversionOutput {
   const node = $createQuoteNode();
+  if (element.style !== null) {
+    node.setFormat(element.style.textAlign as ElementFormatType);
+    setNodeIndentFromDOM(element, node);
+  }
   return {node};
 }
 
-export function $createHeadingNode(headingTag: HeadingTagType): HeadingNode {
+export function $createHeadingNode(
+  headingTag: HeadingTagType = 'h1',
+): HeadingNode {
   return $applyNodeReplacement(new HeadingNode(headingTag));
 }
 
@@ -377,13 +450,11 @@ function onPasteForRichText(
     () => {
       const selection = $getSelection();
       const clipboardData =
-        event instanceof InputEvent || event instanceof KeyboardEvent
+        objectKlassEquals(event, InputEvent) ||
+        objectKlassEquals(event, KeyboardEvent)
           ? null
-          : event.clipboardData;
-      if (
-        clipboardData != null &&
-        ($isRangeSelection(selection) || DEPRECATED_$isGridSelection(selection))
-      ) {
+          : (event as ClipboardEvent).clipboardData;
+      if (clipboardData != null && selection !== null) {
         $insertDataTransferForRichText(clipboardData, selection, editor);
       }
     },
@@ -397,9 +468,9 @@ async function onCutForRichText(
   event: CommandPayloadType<typeof CUT_COMMAND>,
   editor: LexicalEditor,
 ): Promise<void> {
-  await copyToClipboard__EXPERIMENTAL(
+  await copyToClipboard(
     editor,
-    event instanceof ClipboardEvent ? event : null,
+    objectKlassEquals(event, ClipboardEvent) ? (event as ClipboardEvent) : null,
   );
   editor.update(() => {
     const selection = $getSelection();
@@ -412,16 +483,16 @@ async function onCutForRichText(
 }
 
 // Clipboard may contain files that we aren't allowed to read. While the event is arguably useless,
-// in certain ocassions, we want to know whether it was a file transfer, as opposed to text. We
+// in certain occasions, we want to know whether it was a file transfer, as opposed to text. We
 // control this with the first boolean flag.
 export function eventFiles(
   event: DragEvent | PasteCommandType,
 ): [boolean, Array<File>, boolean] {
   let dataTransfer: null | DataTransfer = null;
-  if (event instanceof DragEvent) {
-    dataTransfer = event.dataTransfer;
-  } else if (event instanceof ClipboardEvent) {
-    dataTransfer = event.clipboardData;
+  if (objectKlassEquals(event, DragEvent)) {
+    dataTransfer = (event as DragEvent).dataTransfer;
+  } else if (objectKlassEquals(event, ClipboardEvent)) {
+    dataTransfer = (event as ClipboardEvent).clipboardData;
   }
 
   if (dataTransfer === null) {
@@ -435,33 +506,36 @@ export function eventFiles(
   return [hasFiles, Array.from(dataTransfer.files), hasContent];
 }
 
-function handleIndentAndOutdent(
-  insertTab: (node: LexicalNode) => void,
+function $handleIndentAndOutdent(
   indentOrOutdent: (block: ElementNode) => void,
-): void {
+): boolean {
   const selection = $getSelection();
   if (!$isRangeSelection(selection)) {
-    return;
+    return false;
   }
   const alreadyHandled = new Set();
   const nodes = selection.getNodes();
-
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     const key = node.getKey();
     if (alreadyHandled.has(key)) {
       continue;
     }
-    const parentBlock = $getNearestBlockElementAncestorOrThrow(node);
+    const parentBlock = $findMatchingParent(
+      node,
+      (parentNode): parentNode is ElementNode =>
+        $isElementNode(parentNode) && !parentNode.isInline(),
+    );
+    if (parentBlock === null) {
+      continue;
+    }
     const parentKey = parentBlock.getKey();
-    if (parentBlock.canInsertTab()) {
-      insertTab(node);
-      alreadyHandled.add(key);
-    } else if (parentBlock.canIndent() && !alreadyHandled.has(parentKey)) {
+    if (parentBlock.canIndent() && !alreadyHandled.has(parentKey)) {
       alreadyHandled.add(parentKey);
       indentOrOutdent(parentBlock);
     }
   }
+  return alreadyHandled.size > 0;
 }
 
 function $isTargetWithinDecorator(target: HTMLElement): boolean {
@@ -472,6 +546,19 @@ function $isTargetWithinDecorator(target: HTMLElement): boolean {
 function $isSelectionAtEndOfRoot(selection: RangeSelection) {
   const focus = selection.focus;
   return focus.key === 'root' && focus.offset === $getRoot().getChildrenSize();
+}
+
+/**
+ * Resets the capitalization of the selection to default.
+ * Called when the user presses space, tab, or enter key.
+ * @param selection The selection to reset the capitalization of.
+ */
+function $resetCapitalization(selection: RangeSelection): void {
+  for (const format of ['lowercase', 'uppercase', 'capitalize'] as const) {
+    if (selection.hasFormat(format)) {
+      selection.toggleFormat(format);
+    }
+  }
 }
 
 export function registerRichText(editor: LexicalEditor): () => void {
@@ -530,16 +617,11 @@ export function registerRichText(editor: LexicalEditor): () => void {
         const selection = $getSelection();
 
         if (typeof eventOrText === 'string') {
-          if ($isRangeSelection(selection)) {
+          if (selection !== null) {
             selection.insertText(eventOrText);
-          } else if (DEPRECATED_$isGridSelection(selection)) {
-            // TODO: Insert into the first cell & clear selection.
           }
         } else {
-          if (
-            !$isRangeSelection(selection) &&
-            !DEPRECATED_$isGridSelection(selection)
-          ) {
+          if (selection === null) {
             return false;
           }
 
@@ -591,8 +673,14 @@ export function registerRichText(editor: LexicalEditor): () => void {
         }
         const nodes = selection.getNodes();
         for (const node of nodes) {
-          const element = $getNearestBlockElementAncestorOrThrow(node);
-          element.setFormat(format);
+          const element = $findMatchingParent(
+            node,
+            (parentNode): parentNode is ElementNode =>
+              $isElementNode(parentNode) && !parentNode.isInline(),
+          );
+          if (element !== null) {
+            element.setFormat(format);
+          }
         }
         return true;
       },
@@ -623,44 +711,32 @@ export function registerRichText(editor: LexicalEditor): () => void {
       COMMAND_PRIORITY_EDITOR,
     ),
     editor.registerCommand(
+      INSERT_TAB_COMMAND,
+      () => {
+        $insertNodes([$createTabNode()]);
+        return true;
+      },
+      COMMAND_PRIORITY_EDITOR,
+    ),
+    editor.registerCommand(
       INDENT_CONTENT_COMMAND,
       () => {
-        handleIndentAndOutdent(
-          () => {
-            editor.dispatchCommand(CONTROLLED_TEXT_INSERTION_COMMAND, '\t');
-          },
-          (block) => {
-            const indent = block.getIndent();
-            if (indent !== 10) {
-              block.setIndent(indent + 1);
-            }
-          },
-        );
-        return true;
+        return $handleIndentAndOutdent((block) => {
+          const indent = block.getIndent();
+          block.setIndent(indent + 1);
+        });
       },
       COMMAND_PRIORITY_EDITOR,
     ),
     editor.registerCommand(
       OUTDENT_CONTENT_COMMAND,
       () => {
-        handleIndentAndOutdent(
-          (node) => {
-            if ($isTextNode(node)) {
-              const textContent = node.getTextContent();
-              const character = textContent[textContent.length - 1];
-              if (character === '\t') {
-                editor.dispatchCommand(DELETE_CHARACTER_COMMAND, true);
-              }
-            }
-          },
-          (block) => {
-            const indent = block.getIndent();
-            if (indent !== 0) {
-              block.setIndent(indent - 1);
-            }
-          },
-        );
-        return true;
+        return $handleIndentAndOutdent((block) => {
+          const indent = block.getIndent();
+          if (indent > 0) {
+            block.setIndent(indent - 1);
+          }
+        });
       },
       COMMAND_PRIORITY_EDITOR,
     ),
@@ -681,16 +757,13 @@ export function registerRichText(editor: LexicalEditor): () => void {
           }
         } else if ($isRangeSelection(selection)) {
           const possibleNode = $getAdjacentNode(selection.focus, true);
-          if ($isDecoratorNode(possibleNode) && !possibleNode.isIsolated()) {
-            possibleNode.selectPrevious();
-            event.preventDefault();
-            return true;
-          } else if (
-            $isElementNode(possibleNode) &&
-            !possibleNode.isInline() &&
-            !possibleNode.canBeEmpty()
+          if (
+            !event.shiftKey &&
+            $isDecoratorNode(possibleNode) &&
+            !possibleNode.isIsolated() &&
+            !possibleNode.isInline()
           ) {
-            possibleNode.select();
+            possibleNode.selectPrevious();
             event.preventDefault();
             return true;
           }
@@ -717,7 +790,12 @@ export function registerRichText(editor: LexicalEditor): () => void {
             return true;
           }
           const possibleNode = $getAdjacentNode(selection.focus, false);
-          if ($isDecoratorNode(possibleNode) && !possibleNode.isIsolated()) {
+          if (
+            !event.shiftKey &&
+            $isDecoratorNode(possibleNode) &&
+            !possibleNode.isIsolated() &&
+            !possibleNode.isInline()
+          ) {
             possibleNode.selectNext();
             event.preventDefault();
             return true;
@@ -794,7 +872,7 @@ export function registerRichText(editor: LexicalEditor): () => void {
         if (!$isRangeSelection(selection)) {
           return false;
         }
-        event.preventDefault();
+
         const {anchor} = selection;
         const anchorNode = anchor.getNode();
 
@@ -805,9 +883,18 @@ export function registerRichText(editor: LexicalEditor): () => void {
         ) {
           const element = $getNearestBlockElementAncestorOrThrow(anchorNode);
           if (element.getIndent() > 0) {
+            event.preventDefault();
             return editor.dispatchCommand(OUTDENT_CONTENT_COMMAND, undefined);
           }
         }
+
+        // Exception handling for iOS native behavior instead of Lexical's behavior when using Korean on iOS devices.
+        // more details - https://github.com/facebook/lexical/issues/5841
+        if (IS_IOS && navigator.language === 'ko-KR') {
+          return false;
+        }
+        event.preventDefault();
+
         return editor.dispatchCommand(DELETE_CHARACTER_COMMAND, true);
       },
       COMMAND_PRIORITY_EDITOR,
@@ -834,6 +921,9 @@ export function registerRichText(editor: LexicalEditor): () => void {
         if (!$isRangeSelection(selection)) {
           return false;
         }
+
+        $resetCapitalization(selection);
+
         if (event !== null) {
           // If we have beforeinput, then we can avoid blocking
           // the default behavior. This ensures that the iOS can
@@ -842,7 +932,10 @@ export function registerRichText(editor: LexicalEditor): () => void {
           // This can also cause a strange performance issue in
           // Safari, where there is a noticeable pause due to
           // preventing the key down of enter.
-          if ((IS_IOS || IS_SAFARI) && CAN_USE_BEFORE_INPUT) {
+          if (
+            (IS_IOS || IS_SAFARI || IS_APPLE_WEBKIT) &&
+            CAN_USE_BEFORE_INPUT
+          ) {
             return false;
           }
           event.preventDefault();
@@ -943,11 +1036,22 @@ export function registerRichText(editor: LexicalEditor): () => void {
       COMMAND_PRIORITY_EDITOR,
     ),
     editor.registerCommand(
+      SELECT_ALL_COMMAND,
+      () => {
+        $selectAll();
+
+        return true;
+      },
+      COMMAND_PRIORITY_EDITOR,
+    ),
+    editor.registerCommand(
       COPY_COMMAND,
       (event) => {
-        copyToClipboard__EXPERIMENTAL(
+        copyToClipboard(
           editor,
-          event instanceof ClipboardEvent ? event : null,
+          objectKlassEquals(event, ClipboardEvent)
+            ? (event as ClipboardEvent)
+            : null,
         );
         return true;
       },
@@ -970,13 +1074,44 @@ export function registerRichText(editor: LexicalEditor): () => void {
           return true;
         }
 
-        const selection = $getSelection();
+        // if inputs then paste within the input ignore creating a new node on paste event
         if (
-          $isRangeSelection(selection) ||
-          DEPRECATED_$isGridSelection(selection)
+          isDOMNode(event.target) &&
+          isSelectionCapturedInDecoratorInput(event.target)
         ) {
+          return false;
+        }
+
+        const selection = $getSelection();
+        if (selection !== null) {
           onPasteForRichText(event, editor);
           return true;
+        }
+
+        return false;
+      },
+      COMMAND_PRIORITY_EDITOR,
+    ),
+    editor.registerCommand(
+      KEY_SPACE_COMMAND,
+      (_) => {
+        const selection = $getSelection();
+
+        if ($isRangeSelection(selection)) {
+          $resetCapitalization(selection);
+        }
+
+        return false;
+      },
+      COMMAND_PRIORITY_EDITOR,
+    ),
+    editor.registerCommand(
+      KEY_TAB_COMMAND,
+      (_) => {
+        const selection = $getSelection();
+
+        if ($isRangeSelection(selection)) {
+          $resetCapitalization(selection);
         }
 
         return false;
